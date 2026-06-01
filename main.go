@@ -67,9 +67,18 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 		kvmdBasicAuth := "Basic " + base64.StdEncoding.EncodeToString(
 			[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
 		)
-		tlsTransport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
+		// Phase E: TLS verification policy for the local kvmd.
+		//
+		// kvmd ships with a self-signed cert by default — verifying
+		// it would fail every connection. So InsecureSkipVerify is
+		// the practical default. To make that defensible:
+		//   - It's only allowed when the kvmd URL is a loopback
+		//     address (127.0.0.1, localhost, ::1). For any other
+		//     host we refuse to skip — operator either fixes their
+		//     config or sets KVMFLEET_KVMD_VERIFY_TLS=true.
+		//   - Operators who put a real cert on kvmd can opt in to
+		//     verification with KVMFLEET_KVMD_VERIFY_TLS=true.
+		tlsTransport := buildKvmdTransport(target)
 
 		// Login to kvmd to get a session cookie. This is needed for endpoints
 		// like ttyd's /token which don't accept Basic auth directly.
@@ -454,6 +463,46 @@ func consoleURL(cfg config) string {
 		port = port[1:]
 	}
 	return fmt.Sprintf("http://%s:%s", cfg.ConsoleHost, port)
+}
+
+// buildKvmdTransport returns an *http.Transport configured for the
+// local kvmd connection. Policy:
+//
+//   - If KVMFLEET_KVMD_VERIFY_TLS=true, always verify — even on
+//     loopback. Operator opted in, presumably because they put a
+//     real cert on kvmd.
+//   - Otherwise, only skip verification for loopback hosts
+//     (127.0.0.1, localhost, ::1). Loopback + self-signed kvmd cert
+//     is the default PiKVM config and the original reason for the
+//     skip.
+//   - If the URL is NOT loopback AND the operator hasn't opted in
+//     to verification, panic. This catches a misconfigured agent
+//     that points at a remote kvmd host with verify off — silent
+//     MITM bait we refuse to support.
+func buildKvmdTransport(u *url.URL) *http.Transport {
+	verifyOptIn := envBool("KVMFLEET_KVMD_VERIFY_TLS", false)
+	host := u.Hostname()
+	isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
+
+	if verifyOptIn {
+		// Operator wants verification — return a default transport.
+		return &http.Transport{}
+	}
+	if isLoopback {
+		// Default path: loopback + self-signed cert + skip verify.
+		// Safe because the connection is process-local; MITM requires
+		// already being on the host.
+		return &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+	log.Fatalf(
+		"refusing to skip TLS verification for non-loopback kvmd URL %q. "+
+			"Either point at a loopback address, OR set "+
+			"KVMFLEET_KVMD_VERIFY_TLS=true (with a real cert on kvmd).",
+		u.String(),
+	)
+	return nil // unreachable; log.Fatalf exits
 }
 
 func envOr(k, d string) string {
@@ -893,12 +942,12 @@ func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any,
 			opts.Subprotocols = []string{socketSubproto}
 		}
 	} else if u.Scheme == "wss" {
-		// Skip TLS verify for self-signed kvmd certs
-		opts.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
+		// Phase E: same policy as the HTTP reverse-proxy above —
+		// InsecureSkipVerify is only safe for loopback kvmd with
+		// its default self-signed cert. buildKvmdTransport enforces
+		// the loopback restriction + honours the
+		// KVMFLEET_KVMD_VERIFY_TLS opt-in.
+		opts.HTTPClient = &http.Client{Transport: buildKvmdTransport(u)}
 	}
 
 	c, _, err := websocket.Dial(dialCtx, u.String(), opts)
