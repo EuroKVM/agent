@@ -124,6 +124,15 @@ The agent maintains a single outbound WebSocket to the platform. Over this conne
 
 Each WebSocket channel gets a unique ID and is multiplexed over the single agent tunnel. The agent routes Janus connections directly to the Unix socket (`/run/kvmd/janus-ws.sock`) for maximum compatibility.
 
+## Security
+
+Found a security issue? **Don't** file a public GitHub issue. See
+[SECURITY.md](SECURITY.md) for the reporting channel, response SLA,
+scope, and our trust-model summary.
+
+The agent runs with privileged access on customer infrastructure — we
+take security reports seriously and respond within 48 hours.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
