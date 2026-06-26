@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# SINGLE SOURCE OF TRUTH NOTE (2026-06-03):
+# This script is also published in the public agent repo at
+# https://github.com/KVMFleet/agent/blob/main/install.sh under
+# Apache 2.0. The two copies are identical today. Edits should be
+# made on the public agent repo first (so external contributors
+# can see them) and synced here via a routine sync step. Drift
+# between the two is a bug — flag and fix.
+#
+# Security reports: see SECURITY.md in the public agent repo
+# (https://github.com/KVMFleet/agent/blob/main/SECURITY.md) — NOT
+# this kvmfleet repo, which is internal-platform-shaped.
+#
 # KVM Fleet — Universal agent installer
 #
 # WHAT THIS DOES (read before running):
@@ -43,9 +56,11 @@
 #                            recommended; some test harnesses need this).
 #
 # Supports:
-#   - JetKVM  (BusyBox Linux, armv7l, /etc/init.d/)
-#   - PiKVM   (Arch Linux, aarch64, systemd)
-#   - Generic Linux (systemd, x86_64/aarch64/armv7l)
+#   - PiKVM   (Arch Linux, aarch64, systemd)           — verified
+#   - Generic Linux (systemd, x86_64/aarch64/armv7l)   — verified
+#   - BliKVM / TinyPilot / NanoKVM / JetKVM            — Experimental
+#     (BliKVM proxies the same kvmd as PiKVM; the others are fronted by
+#      the agent's raw reverse-proxy console mode — KVMFLEET_CONSOLE_MODE=proxy)
 set -eu
 
 PLATFORM_URL="${KVMFLEET_API:-https://app.kvmfleet.io}"
@@ -59,6 +74,10 @@ DEVICE_NAME="${KVMFLEET_DEVICE_NAME:-}"
 DEVICE_TAGS="${KVMFLEET_DEVICE_TAGS:-}"
 KVMD_USER="${KVMFLEET_KVMD_USER:-admin}"
 KVMD_PASS="${KVMFLEET_KVMD_PASS:-}"
+# Explicit device-type override. Auto-detection covers the common cases,
+# but operators can force a type when detection can't tell two boards
+# apart (e.g. a BliKVM running stock PiKVM-OS). Empty = auto-detect.
+DEVICE_OVERRIDE="${KVMFLEET_DEVICE:-}"
 DRY_RUN=0
 FORCE=0
 SKIP_KVMD_DEFAULT_CHECK=0
@@ -71,6 +90,7 @@ while [ $# -gt 0 ]; do
         --api)       PLATFORM_URL="$2"; shift 2 ;;
         --kvmd-user) KVMD_USER="$2";   shift 2 ;;
         --kvmd-pass) KVMD_PASS="$2";   shift 2 ;;
+        --device)    DEVICE_OVERRIDE="$2"; shift 2 ;;
         --dry-run)   DRY_RUN=1;        shift ;;
         --force)     FORCE=1;          shift ;;
         --skip-kvmd-default-check) SKIP_KVMD_DEFAULT_CHECK=1; shift ;;
@@ -83,7 +103,9 @@ while [ $# -gt 0 ]; do
             echo "  --tags <t1,t2>            Comma-separated tags (optional)"
             echo "  --api <url>               Platform URL (default: https://app.kvmfleet.io)"
             echo "  --kvmd-user <user>        Local kvmd username (default: admin)"
-            echo "  --kvmd-pass <pass>        Local kvmd password (required for PiKVM/JetKVM)"
+            echo "  --kvmd-pass <pass>        Local kvmd/console password (required for PiKVM/BliKVM)"
+            echo "  --device <type>           Force device type: pikvm | blikvm | jetkvm |"
+            echo "                            tinypilot | nanokvm | generic (default: auto-detect)"
             echo "  --dry-run                 Print steps without executing"
             echo "  --force                   Overwrite an existing install (default: no-op)"
             echo "  --skip-kvmd-default-check Skip kvmd default-password preflight"
@@ -119,9 +141,23 @@ detect_init_system() {
 }
 
 detect_device_type() {
+    # Explicit override wins over auto-detection.
+    if [ -n "$DEVICE_OVERRIDE" ]; then
+        echo "$DEVICE_OVERRIDE"
+        return
+    fi
+    # Specific non-kvmd boards first — their markers are unambiguous, and
+    # they must be matched before the generic kvmd probe below.
     if [ -f /userdata/kvm_config.json ]; then
-        echo "jetkvm"
+        echo "jetkvm"                          # JetKVM (BusyBox, /userdata)
+    elif [ -d /opt/tinypilot ]; then
+        echo "tinypilot"                        # TinyPilot (Flask app under /opt)
+    elif [ -d /kvmapp ]; then
+        echo "nanokvm"                          # Sipeed NanoKVM (/kvmapp firmware)
     elif command -v kvmd >/dev/null 2>&1 || [ -f /etc/kvmd/main.yaml ]; then
+        # PiKVM and BliKVM both run stock kvmd and are indistinguishable
+        # here. We report pikvm (full kvmd console works for both); pass
+        # --device blikvm to stamp the BliKVM hw_kind label.
         echo "pikvm"
     else
         echo "generic"
@@ -131,11 +167,33 @@ detect_device_type() {
 INIT_SYSTEM=$(detect_init_system)
 DEVICE_TYPE=$(detect_device_type)
 
+# Console mode + hardware-kind label, derived from the device type. Boards
+# that run kvmd (PiKVM, BliKVM) use the full kvmd console path; the rest are
+# fronted by the agent's raw reverse-proxy console mode (Experimental).
+case "$DEVICE_TYPE" in
+    pikvm)     CONSOLE_MODE="kvmd";  HW_KIND="pikvm-v4" ;;
+    blikvm)    CONSOLE_MODE="kvmd";  HW_KIND="blikvm" ;;
+    jetkvm)    CONSOLE_MODE="proxy"; HW_KIND="jetkvm" ;;
+    tinypilot) CONSOLE_MODE="proxy"; HW_KIND="tinypilot" ;;
+    nanokvm)   CONSOLE_MODE="proxy"; HW_KIND="nanokvm" ;;
+    generic)   CONSOLE_MODE="kvmd";  HW_KIND="generic" ;;
+    *)
+        echo "ERROR: unknown --device '$DEVICE_TYPE'."
+        echo "Valid: pikvm | blikvm | jetkvm | tinypilot | nanokvm | generic"
+        exit 1 ;;
+esac
+# Allow KVMFLEET_HW_KIND to win if the operator set a more specific label.
+HW_KIND="${KVMFLEET_HW_KIND:-$HW_KIND}"
+
 echo "=== KVM Fleet Agent Installer ==="
 echo "  Platform:    $PLATFORM_URL"
 echo "  Arch:        $ARCH → $BINARY_ARCH"
 echo "  Init system: $INIT_SYSTEM"
-echo "  Device type: $DEVICE_TYPE"
+echo "  Device type: $DEVICE_TYPE (console mode: $CONSOLE_MODE)"
+case "$DEVICE_TYPE" in
+    blikvm|jetkvm|tinypilot|nanokvm)
+        echo "  Support:     Experimental" ;;
+esac
 echo ""
 
 # --- Paths (vary by device type) -------------------------------------------
@@ -147,7 +205,15 @@ case "$DEVICE_TYPE" in
         STATE_FILE="$INSTALL_DIR/state.json"
         TOKEN_FILE="$INSTALL_DIR/enrollment.token"
         ;;
-    pikvm)
+    nanokvm)
+        # NanoKVM firmware mounts / read-only-ish; /kvmapp is the writable
+        # app partition where the vendor keeps state.
+        INSTALL_DIR="/kvmapp/kvmfleet"
+        AGENT_BIN="$INSTALL_DIR/agent"
+        STATE_FILE="$INSTALL_DIR/state.json"
+        TOKEN_FILE="$INSTALL_DIR/enrollment.token"
+        ;;
+    pikvm|blikvm|tinypilot)
         INSTALL_DIR="/var/lib/kvmfleet"
         AGENT_BIN="/usr/local/bin/kvmfleet-agent"
         STATE_FILE="$INSTALL_DIR/state.json"
@@ -189,10 +255,12 @@ fi
 # minuscule compared to the cost of installing onto a popped device and
 # logging the false comfort of "fleet protected by KVM Fleet."
 check_kvmd_default_password() {
+    # Only the kvmd boards expose the /api/auth/login endpoint this probe
+    # targets. Proxy-console devices (JetKVM/TinyPilot/NanoKVM) have their
+    # own web-UI auth and are out of scope for this specific check.
     case "$DEVICE_TYPE" in
-        pikvm)   _kvmd_url="https://127.0.0.1" ;;
-        jetkvm)  _kvmd_url="http://127.0.0.1" ;;
-        *)       return 0 ;;
+        pikvm|blikvm)  _kvmd_url="https://127.0.0.1" ;;
+        *)             return 0 ;;
     esac
     if [ "$SKIP_KVMD_DEFAULT_CHECK" -eq 1 ]; then
         echo "(--skip-kvmd-default-check passed — not testing kvmd default password)"
@@ -233,9 +301,9 @@ check_kvmd_default_password
 
 # --- PiKVM: ensure filesystem is writable -----------------------------------
 
-if [ "$DEVICE_TYPE" = "pikvm" ]; then
+if [ "$DEVICE_TYPE" = "pikvm" ] || [ "$DEVICE_TYPE" = "blikvm" ]; then
     if mount | grep "on / " | grep -q "ro,\|ro)"; then
-        echo "PiKVM filesystem is read-only. Making writable..."
+        echo "PiKVM/BliKVM filesystem is read-only. Making writable..."
         mount -o remount,rw / 2>/dev/null || true
         PIKVM_REMOUNT_RO=1
     fi
@@ -377,14 +445,21 @@ chmod 600 "$TOKEN_FILE"
 
 KVMD_URL=""
 case "$DEVICE_TYPE" in
-    jetkvm)  KVMD_URL="http://127.0.0.1:80" ;;
-    pikvm)   KVMD_URL="https://127.0.0.1" ;;
+    pikvm|blikvm)  KVMD_URL="https://127.0.0.1" ;;     # stock kvmd over TLS
+    jetkvm)        KVMD_URL="http://127.0.0.1:80" ;;   # JetKVM web UI
+    tinypilot)     KVMD_URL="http://127.0.0.1:80" ;;   # TinyPilot web UI
+    nanokvm)       KVMD_URL="http://127.0.0.1:80" ;;   # NanoKVM web UI
 esac
+# Allow an explicit override (e.g. a non-default web-UI port).
+KVMD_URL="${KVMFLEET_KVMD_URL:-$KVMD_URL}"
 
-# kvmd password is required on devices that proxy through a local kvmd
-# (PiKVM, JetKVM). Generic Linux installs without kvmd skip this.
+# A kvmd password is required on the boards that proxy through a real local
+# kvmd (PiKVM, BliKVM) — that's the credential the agent uses to reach the
+# console. The Experimental proxy devices (JetKVM/TinyPilot/NanoKVM) front
+# their own web UI; a console password is optional there (used as HTTP Basic
+# auth only if the device requires it).
 case "$DEVICE_TYPE" in
-    pikvm|jetkvm)
+    pikvm|blikvm)
         if [ -z "$KVMD_PASS" ]; then
             echo "ERROR: this device proxies through a local kvmd that requires a password."
             echo "Either:"
@@ -407,13 +482,73 @@ esac
 # file so they aren't world-readable in /etc/systemd/system/.
 KVMD_ENV_DIR="/etc/kvmfleet"
 KVMD_ENV_FILE="$KVMD_ENV_DIR/agent.env"
+mkdir -p "$KVMD_ENV_DIR"
+# Start fresh; we'll append serial detection below.
+: > "$KVMD_ENV_FILE"
 if [ -n "$KVMD_PASS" ]; then
-    mkdir -p "$KVMD_ENV_DIR"
-    cat > "$KVMD_ENV_FILE" <<KVMDENV
+    cat >> "$KVMD_ENV_FILE" <<KVMDENV
 KVMFLEET_KVMD_USER=$KVMD_USER
 KVMFLEET_KVMD_PASS=$KVMD_PASS
 KVMDENV
-    chmod 600 "$KVMD_ENV_FILE"
+fi
+
+# Cascade 11: auto-detect a serial bridge device. Probe USB-CDC, FTDI,
+# CH340, etc. first (most operator-wired adapters), then the Pi's
+# built-in GPIO UART (/dev/ttyAMA0) as a fallback. If nothing matches
+# the agent's /api/serial returns 404 with a hint, instead of a
+# tunnel-level error. Operator can override by setting
+# KVMFLEET_SERIAL_DEV in /etc/kvmfleet/agent.env after install.
+SERIAL_DEV=""
+for cand in /dev/ttyUSB0 /dev/ttyACM0; do
+    if [ -e "$cand" ]; then
+        SERIAL_DEV="$cand"
+        break
+    fi
+done
+# If no serial hardware is wired, the loopback bridge gives a real shell on a
+# pty so the Serial button still works. That shell is reachable by whoever opens
+# the channel (the platform), so we only auto-enable it for the experimental,
+# console-less device kinds (JetKVM / TinyPilot / NanoKVM) that have no other
+# terminal — and even then it runs UNPRIVILEGED (dropped to `nobody`) and behind
+# an explicit allow flag the agent enforces. For every other device, no serial
+# hardware means the Serial button is simply disabled; an operator who wants the
+# loopback shell opts in deliberately (set KVMFLEET_SERIAL_DEV=loopback +
+# KVMFLEET_ALLOW_LOOPBACK_SHELL=1 in the env file).
+ALLOW_LOOPBACK_SHELL=0
+if [ -z "$SERIAL_DEV" ]; then
+    case "$DEVICE_TYPE" in
+        jetkvm|tinypilot|nanokvm)
+            SERIAL_DEV="loopback"
+            ALLOW_LOOPBACK_SHELL=1
+            ;;
+        *)
+            SERIAL_DEV=""  # Serial button disabled; opt in manually if wanted
+            ;;
+    esac
+fi
+cat >> "$KVMD_ENV_FILE" <<SERIALENV
+KVMFLEET_SERIAL_DEV=$SERIAL_DEV
+KVMFLEET_SERIAL_BAUD=${KVMFLEET_SERIAL_BAUD:-115200}
+KVMFLEET_ALLOW_LOOPBACK_SHELL=$ALLOW_LOOPBACK_SHELL
+KVMFLEET_LOOPBACK_SHELL_USER=${KVMFLEET_LOOPBACK_SHELL_USER:-nobody}
+SERIALENV
+if [ "$SERIAL_DEV" = "loopback" ]; then
+    echo "  serial bridge: loopback mode (unprivileged /bin/bash on a pty as 'nobody' — no hardware wired)"
+elif [ -n "$SERIAL_DEV" ]; then
+    echo "  serial bridge: enabled on $SERIAL_DEV @ ${KVMFLEET_SERIAL_BAUD:-115200} baud"
+else
+    echo "  serial bridge: disabled (no serial hardware detected; set KVMFLEET_SERIAL_DEV + KVMFLEET_ALLOW_LOOPBACK_SHELL=1 to opt into a loopback shell)"
+fi
+
+chmod 600 "$KVMD_ENV_FILE"
+
+# The agent normally runs with ZERO Linux capabilities. The loopback shell is
+# the one feature that needs CAP_SETUID/CAP_SETGID — to drop the bridged shell
+# to an unprivileged user. Grant them only when loopback is actually enabled.
+if [ "$ALLOW_LOOPBACK_SHELL" = "1" ]; then
+    CAP_BOUNDING="CAP_SETUID CAP_SETGID"
+else
+    CAP_BOUNDING=""
 fi
 
 # --- Set up service ---------------------------------------------------------
@@ -445,6 +580,8 @@ Environment=KVMFLEET_STATE=$STATE_FILE
 Environment=KVMFLEET_DEVICE_NAME=$DEVICE_NAME
 Environment=KVMFLEET_DEVICE_TAGS=$DEVICE_TAGS
 Environment=KVMFLEET_KVMD_URL=$KVMD_URL
+Environment=KVMFLEET_CONSOLE_MODE=$CONSOLE_MODE
+Environment=KVMFLEET_HW_KIND=$HW_KIND
 Environment=KVMFLEET_CONSOLE_ADDR=off
 EnvironmentFile=-$KVMD_ENV_FILE
 
@@ -462,7 +599,12 @@ ReadWritePaths=$INSTALL_DIR
 # Empty CapabilityBoundingSet = no Linux capabilities at all. The
 # agent runs as root for kvmd-socket access but never needs root-y
 # powers; bounding-set zero stops it from gaining any post-exploit.
-CapabilityBoundingSet=
+# EXCEPTION: when the loopback shell is enabled, the agent needs
+# CAP_SETUID/CAP_SETGID so it can DROP the bridged shell to an
+# unprivileged user — without these, a uid-0 process with an empty
+# bounding set cannot setuid() and the drop fails. We grant them only
+# on boxes that run the loopback shell; everyone else keeps zero caps.
+CapabilityBoundingSet=$CAP_BOUNDING
 AmbientCapabilities=
 # Network: agent talks IPv4 + IPv6 over TCP/UDP, and AF_UNIX for the
 # local kvmd socket on PiKVM. No other families needed.
@@ -501,6 +643,8 @@ export KVMFLEET_STATE="$STATE_FILE"
 export KVMFLEET_DEVICE_NAME="$DEVICE_NAME"
 export KVMFLEET_DEVICE_TAGS="$DEVICE_TAGS"
 export KVMFLEET_KVMD_URL="$KVMD_URL"
+export KVMFLEET_CONSOLE_MODE="$CONSOLE_MODE"
+export KVMFLEET_HW_KIND="$HW_KIND"
 export KVMFLEET_CONSOLE_ADDR="off"
 [ -f "$KVMD_ENV_FILE" ] && . "$KVMD_ENV_FILE" && export KVMFLEET_KVMD_USER KVMFLEET_KVMD_PASS
 
@@ -543,6 +687,8 @@ INITSCRIPT
         KVMFLEET_DEVICE_NAME="$DEVICE_NAME" \
         KVMFLEET_DEVICE_TAGS="$DEVICE_TAGS" \
         KVMFLEET_KVMD_URL="$KVMD_URL" \
+        KVMFLEET_CONSOLE_MODE="$CONSOLE_MODE" \
+        KVMFLEET_HW_KIND="$HW_KIND" \
         KVMFLEET_CONSOLE_ADDR="off" \
             "$AGENT_BIN" run &
         ;;

@@ -58,7 +58,7 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 			st.Name, cfg.HWKind, st.DeviceID, consoleMode(cfg))
 	})
 
-	if cfg.KvmdURL != "" {
+	if cfg.KvmdURL != "" && cfg.ConsoleMode != "proxy" {
 		// Real mode: reverse-proxy every request to the local kvmd web UI.
 		target, err := url.Parse(cfg.KvmdURL)
 		if err != nil {
@@ -165,8 +165,48 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 		// Video track + kvmd source is a follow-up phase.
 		mux.HandleFunc("/internal/webrtc/offer", makeWebrtcOfferHandler(cfg, kvmdBasicAuth, kvmdCookies, tlsTransport))
 
+		// Note (cascade 11): /api/serial used to be an HTTP mux handler
+		// here but the platform reaches it via `ws.open` (the outbound
+		// tunnel-WS dialer), not through the inbound HTTP mux. The
+		// interceptor in handleWSOpen now routes /api/serial to
+		// handleSerialOpen (agent/serial.go) — frames bridge through
+		// the existing wsChannels machinery with a `serialOut *os.File`
+		// instead of a kvmd WebSocket.
+
 		mux.Handle("/", proxy)
 		log.Printf("console mode: kvmd reverse-proxy → %s", cfg.KvmdURL)
+	} else if cfg.KvmdURL != "" {
+		// Experimental raw reverse-proxy: forward the device's local web UI
+		// through the tunnel without any kvmd-specific flow. Used for non-kvmd
+		// KVMs (JetKVM, TinyPilot, NanoKVM). HTTP (incl. MJPEG streams) tunnels;
+		// device-specific WebSocket/WebRTC paths are best-effort.
+		target, err := url.Parse(cfg.KvmdURL)
+		if err != nil {
+			log.Fatalf("bad --kvmd-url: %v", err)
+		}
+		rawTransport := buildKvmdTransport(target)
+		var rawBasicAuth string
+		if cfg.KvmdPass != "" {
+			rawBasicAuth = "Basic " + base64.StdEncoding.EncodeToString(
+				[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
+			)
+		}
+		proxy := &httputil.ReverseProxy{
+			Director: func(r *http.Request) {
+				r.URL.Scheme = target.Scheme
+				r.URL.Host = target.Host
+				r.Host = target.Host
+				if rawBasicAuth != "" {
+					r.Header.Set("Authorization", rawBasicAuth)
+				}
+			},
+			Transport: rawTransport,
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				http.Error(w, fmt.Sprintf("device console unreachable: %v", err), http.StatusBadGateway)
+			},
+		}
+		mux.Handle("/", proxy)
+		log.Printf("console mode: raw reverse-proxy → %s (experimental)", cfg.KvmdURL)
 	} else {
 		// Simulate mode: serve the fake BIOS HTML.
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -180,10 +220,13 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 }
 
 func consoleMode(cfg config) string {
-	if cfg.KvmdURL != "" {
-		return "kvmd-proxy"
+	if cfg.KvmdURL == "" {
+		return "simulate"
 	}
-	return "simulate"
+	if cfg.ConsoleMode == "proxy" {
+		return "raw-proxy"
+	}
+	return "kvmd-proxy"
 }
 
 var version = "dev"
@@ -208,9 +251,31 @@ type config struct {
 	KvmdURL     string // upstream kvmd (e.g. "https://127.0.0.1/"); empty = fake HTML
 	KvmdUser    string // kvmd Basic auth username (default: admin)
 	KvmdPass    string // kvmd Basic auth password (default: admin)
+	// Console reverse-proxy mode. "kvmd" (default) does the full PiKVM/BliKVM
+	// kvmd flow (login cookie, ttyd, ISO/MSD, WebRTC). "proxy" is the
+	// experimental raw reverse-proxy for non-kvmd KVMs (JetKVM, TinyPilot,
+	// NanoKVM): it just forwards the device's local web UI through the tunnel,
+	// no kvmd-specific endpoints.
+	ConsoleMode string
 	// Phase B M4: how often the agent calls the mTLS heartbeat
 	// endpoint as a self-test of the cert lifecycle. 0 disables.
 	MtlsHeartbeatInterval time.Duration
+	// Cascade 11: agent-side serial bridge. Empty disables; install.sh
+	// auto-detects /dev/ttyUSB0 → /dev/ttyACM0 → /dev/ttyAMA0 and writes
+	// the first match. Stock PiKVM kvmd has no /api/serial; we serve it
+	// ourselves from agent/serial.go.
+	SerialDev  string
+	SerialBaud int
+	// AllowLoopbackShell gates the SerialDev="loopback" mode, which spawns a
+	// real interactive shell bridged to the platform tunnel. It must be
+	// explicitly enabled (KVMFLEET_ALLOW_LOOPBACK_SHELL=1) — a loopback shell
+	// reachable by the platform is a privileged-access amplifier if the
+	// platform is ever compromised, so we refuse to spawn it by accident.
+	AllowLoopbackShell bool
+	// LoopbackShellUser is the unprivileged account the loopback shell drops to
+	// (default "nobody"). The agent itself runs as root for device access, but
+	// the bridged shell must NOT — so a popped platform can't get root on the box.
+	LoopbackShellUser string
 }
 
 type state struct {
@@ -368,6 +433,7 @@ func loadConfig() config {
 	// kvmd-pass is read from env only — NEVER from a flag, since flags are
 	// visible in `ps -ef` to anyone on the box.
 	kvmdPass := os.Getenv("KVMFLEET_KVMD_PASS")
+	consoleModeFlag := flag.String("console-mode", envOr("KVMFLEET_CONSOLE_MODE", "kvmd"), "console reverse-proxy mode: kvmd (PiKVM/BliKVM) | proxy (experimental non-kvmd: JetKVM/TinyPilot/NanoKVM)")
 	flag.Parse()
 
 	id := *hwID
@@ -403,6 +469,11 @@ func loadConfig() config {
 	hbSeconds := envInt("KVMFLEET_MTLS_HEARTBEAT_SECONDS", 60)
 	mtlsInterval := time.Duration(hbSeconds) * time.Second
 
+	serialDev := envOr("KVMFLEET_SERIAL_DEV", "")
+	serialBaud := envInt("KVMFLEET_SERIAL_BAUD", 115200)
+	allowLoopbackShell := envBool("KVMFLEET_ALLOW_LOOPBACK_SHELL", false)
+	loopbackShellUser := envOr("KVMFLEET_LOOPBACK_SHELL_USER", "nobody")
+
 	return config{
 		APIBase:               strings.TrimRight(*api, "/"),
 		StatePath:             *statePath,
@@ -417,7 +488,12 @@ func loadConfig() config {
 		KvmdURL:               kurl,
 		KvmdUser:              *kvmdUser,
 		KvmdPass:              kvmdPass,
+		ConsoleMode:           *consoleModeFlag,
 		MtlsHeartbeatInterval: mtlsInterval,
+		SerialDev:             serialDev,
+		SerialBaud:            serialBaud,
+		AllowLoopbackShell:    allowLoopbackShell,
+		LoopbackShellUser:     loopbackShellUser,
 	}
 }
 
@@ -660,7 +736,9 @@ func connect(ctx context.Context, cfg config, st *state) error {
 		return err
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
-	log.Printf("ws connected to %s", u.String())
+	// Log without the query string — it carries the agent's auth token, which
+	// must not land in the device's logs.
+	log.Printf("ws connected to %s://%s%s", u.Scheme, u.Host, u.Path)
 
 	// Serialize all writes — WebSocket connections can't be written concurrently.
 	writes := make(chan []byte, 32)
@@ -834,14 +912,23 @@ var (
 )
 
 type wsChannel struct {
-	conn   *websocket.Conn
-	cancel context.CancelFunc
+	conn      *websocket.Conn
+	cancel    context.CancelFunc
+	serialOut *os.File // cascade 11: non-nil for /api/serial channels
 }
 
 func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any, cfg config) {
 	channelID, _ := msg["channel"].(string)
 	path, _ := msg["path"].(string)
 	if channelID == "" || path == "" {
+		return
+	}
+
+	// Cascade 11: /api/serial is served by the agent directly — stock
+	// PiKVM kvmd does not implement it. Bridge WS frames to a local TTY
+	// instead of dialing kvmd. See agent/serial.go.
+	if path == "/api/serial" || strings.HasPrefix(path, "/api/serial?") {
+		go handleSerialOpen(ctx, writes, channelID, cfg)
 		return
 	}
 
@@ -1028,15 +1115,32 @@ func handleWSFrame(msg map[string]any) {
 	}
 
 	isBinary, _ := msg["binary"].(bool)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 
+	var data []byte
 	if isBinary {
 		dataB64, _ := msg["data_b64"].(string)
-		data, _ := base64.StdEncoding.DecodeString(dataB64)
+		data, _ = base64.StdEncoding.DecodeString(dataB64)
+	} else {
+		s, _ := msg["data"].(string)
+		data = []byte(s)
+	}
+
+	// Cascade 11: serial channels write to a TTY instead of a kvmd WS.
+	if ch.serialOut != nil {
+		n, werr := ch.serialOut.Write(data)
+		if werr != nil {
+			log.Printf("serial: write to TTY failed: %v", werr)
+		} else if n > 0 {
+			log.Printf("serial: wrote %d bytes from browser to TTY", n)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if isBinary {
 		ch.conn.Write(ctx, websocket.MessageBinary, data)
 	} else {
-		data, _ := msg["data"].(string)
 		ch.conn.Write(ctx, websocket.MessageText, []byte(data))
 	}
 }
@@ -1047,8 +1151,16 @@ func handleWSClose(msg map[string]any) {
 	ch := wsChannels[channelID]
 	delete(wsChannels, channelID)
 	wsChannelsMu.Unlock()
-	if ch != nil {
+	if ch == nil {
+		return
+	}
+	if ch.serialOut != nil {
+		log.Printf("ws.close: serial channel %s closing TTY", channelID[:8])
+		_ = ch.serialOut.Close()
+	} else if ch.conn != nil {
 		ch.conn.Close(websocket.StatusNormalClosure, "")
+	}
+	if ch.cancel != nil {
 		ch.cancel()
 	}
 }

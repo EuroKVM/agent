@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,11 +25,85 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
+
+// maxISOBytes is a hard ceiling on a downloaded image, independent of the
+// platform-declared size_bytes. The agent runs as root on a Pi-class box; an
+// unbounded download (a malicious or hijacked source_url that streams forever)
+// would fill the root filesystem and wedge the host. 16 GiB comfortably covers
+// real install media (Windows Server ISOs ~6 GB) while bounding the blast radius.
+const maxISOBytes int64 = 16 << 30
+
+// ipPubliclyRoutable reports whether it's safe to let the agent fetch from this
+// IP. The agent sits inside the customer's management LAN, so a source_url that
+// resolves to a private/loopback/link-local address is an SSRF pivot into the
+// very network the platform is governed away from (cloud metadata at
+// 169.254.169.254, other BMCs/PDUs, localhost services). Only globally-routable
+// unicast addresses are permitted.
+func ipPubliclyRoutable(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return false // 169.254.169.254 metadata is link-local → caught here
+	}
+	return ip.IsGlobalUnicast()
+}
+
+// isoDownloadClient returns an *http.Client whose dialer resolves the target
+// host, refuses any non-publicly-routable resolved IP (SSRF guard), and dials
+// the validated IP directly — so a DNS-rebind between the check and the connect
+// can't slip a private address through. The same dialer runs on every redirect
+// hop, so an allowlisted host can't 302 into the metadata endpoint. A generous
+// overall timeout bounds slow-loris sources without breaking large legit ISOs.
+func isoDownloadClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			var target net.IP
+			for _, ip := range ips {
+				if !ipPubliclyRoutable(ip) {
+					return nil, fmt.Errorf("refusing to connect to non-public address %s for host %q (SSRF guard)", ip, host)
+				}
+				if target == nil {
+					target = ip
+				}
+			}
+			if target == nil {
+				return nil, fmt.Errorf("no addresses resolved for host %q", host)
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(target.String(), port))
+		},
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	return &http.Client{
+		Transport: tr,
+		Timeout:   30 * time.Minute, // overall cap; ISOs are large but not infinite
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		},
+	}
+}
 
 type isoMountReq struct {
 	Name      string `json:"name"`
@@ -57,6 +132,20 @@ func makeIsoMountHandler(cfg config, kvmdBasicAuth string, cookies []*http.Cooki
 			req.MediaType = "cdrom"
 		}
 
+		// Validate source_url before fetching: http(s) only, and reject an
+		// oversized declared size up-front so we never start a download we'd
+		// reject after filling the disk. The host/IP SSRF check happens at
+		// dial time (isoDownloadClient), which also covers redirect hops.
+		srcU, err := url.Parse(req.SourceURL)
+		if err != nil || (srcU.Scheme != "http" && srcU.Scheme != "https") {
+			http.Error(w, "source_url must be an http(s) URL", http.StatusBadRequest)
+			return
+		}
+		if req.SizeBytes > maxISOBytes {
+			http.Error(w, fmt.Sprintf("size_bytes %d exceeds the %d-byte limit", req.SizeBytes, maxISOBytes), http.StatusBadRequest)
+			return
+		}
+
 		// Stage 1 — download to a tmp file with a streaming sha256.
 		tmp, err := os.CreateTemp("", "kvmfleet-iso-*.bin")
 		if err != nil {
@@ -69,7 +158,7 @@ func makeIsoMountHandler(cfg config, kvmdBasicAuth string, cookies []*http.Cooki
 		log.Printf("iso.mount: downloading %s (%s) sha256=%s", req.Name, req.SourceURL, req.SHA256)
 
 		dlReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, req.SourceURL, nil)
-		dlClient := &http.Client{}
+		dlClient := isoDownloadClient()
 		dlResp, err := dlClient.Do(dlReq)
 		if err != nil {
 			http.Error(w, "download failed: "+err.Error(), http.StatusBadGateway)
@@ -81,10 +170,22 @@ func makeIsoMountHandler(cfg config, kvmdBasicAuth string, cookies []*http.Cooki
 			return
 		}
 
+		// Cap the number of bytes we'll stream to disk. Use the declared size
+		// when given, else the hard ceiling — either way an attacker can't fill
+		// the root filesystem. Read one extra byte so an over-long body that
+		// matches the declared size on its prefix is still detected.
+		cap := maxISOBytes
+		if req.SizeBytes > 0 {
+			cap = req.SizeBytes
+		}
 		hasher := sha256.New()
-		written, err := io.Copy(io.MultiWriter(tmp, hasher), dlResp.Body)
+		written, err := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(dlResp.Body, cap+1))
 		if err != nil {
 			http.Error(w, "download streaming failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if written > cap {
+			http.Error(w, fmt.Sprintf("download exceeded the %d-byte limit", cap), http.StatusBadRequest)
 			return
 		}
 		gotSum := hex.EncodeToString(hasher.Sum(nil))
