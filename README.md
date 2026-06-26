@@ -10,6 +10,7 @@ Lightweight fleet agent for KVM-over-IP devices. Connects any KVM device with a 
 - Tunnels HTTP requests **and WebSocket connections** through the tunnel — enabling full interactive KVM console (live video, keyboard, mouse) from anywhere
 - Reverse-proxies the device's web UI (kvmd, Janus video gateway, streamer) through the platform
 - Connects to local Unix sockets directly (e.g. Janus WebRTC gateway) for maximum compatibility
+- **Serial console** — bridges a local serial device (e.g. a USB-TTL adapter on `/dev/ttyUSB0`) to the platform's Serial console, for BIOS/UEFI, IPMI serial-over-LAN, switches, and other gear that only speaks UART
 - Works with any KVM device that has a local web interface — no vendor lock-in
 
 ## Install
@@ -82,6 +83,10 @@ All configuration via environment variables or flags:
 | `KVMFLEET_KVMD_USER` | `--kvmd-user` | `admin` | Basic auth username for kvmd |
 | `KVMFLEET_KVMD_PASS` | `--kvmd-pass` | `admin` | Basic auth password for kvmd |
 | `KVMFLEET_CONSOLE_ADDR` | `--console-addr` | `:8080` | Local HTTP server bind (`off` to disable) |
+| `KVMFLEET_SERIAL_DEV` | — | — | Serial device to bridge (e.g. `/dev/ttyUSB0`), or `loopback`. Empty disables the Serial console |
+| `KVMFLEET_SERIAL_BAUD` | — | `115200` | Baud rate for the serial device |
+| `KVMFLEET_ALLOW_LOOPBACK_SHELL` | — | `0` | Required (`1`) to allow `SERIAL_DEV=loopback` to spawn a shell |
+| `KVMFLEET_LOOPBACK_SHELL_USER` | — | `nobody` | Unprivileged user the loopback shell drops to |
 
 ## How it works
 
@@ -121,8 +126,26 @@ The agent maintains a single outbound WebSocket to the platform. Over this conne
 - **kvmd API** (`/api/ws`) — device state, HID events (keyboard/mouse)
 - **Janus WebRTC** (`/janus/ws` via Unix socket) — H.264 live video stream
 - **Streamer** (`/streamer`) — MJPEG fallback video
+- **Serial console** (`/api/serial`) — raw serial bytes, bridged to a local UART (handled by the agent itself; stock kvmd has no serial endpoint)
 
 Each WebSocket channel gets a unique ID and is multiplexed over the single agent tunnel. The agent routes Janus connections directly to the Unix socket (`/run/kvmd/janus-ws.sock`) for maximum compatibility.
+
+## Serial console
+
+When `KVMFLEET_SERIAL_DEV` points at a serial device, the agent opens it at the
+configured baud (raw 8N1) and bridges it to the platform's Serial console — so
+you reach a target's BIOS/UEFI, IPMI serial-over-LAN, or a switch/router console
+through the same outbound tunnel, no extra ports. `install.sh` auto-detects
+`/dev/ttyUSB0` → `/dev/ttyACM0` and writes the first match.
+
+For hardware without a wired serial port, a **loopback** mode
+(`KVMFLEET_SERIAL_DEV=loopback`) spawns a real interactive shell on a pty and
+bridges that instead. Because that shell is reachable by whoever opens the
+channel, it is **off by default** and must be enabled explicitly with
+`KVMFLEET_ALLOW_LOOPBACK_SHELL=1`; even then it runs **unprivileged** (dropped to
+`KVMFLEET_LOOPBACK_SHELL_USER`, default `nobody`) — the agent refuses to bridge a
+root shell. `install.sh` only turns it on automatically for the console-less
+experimental device kinds (JetKVM / TinyPilot / NanoKVM).
 
 ## Security
 
