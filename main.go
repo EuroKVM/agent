@@ -914,7 +914,8 @@ var (
 type wsChannel struct {
 	conn      *websocket.Conn
 	cancel    context.CancelFunc
-	serialOut *os.File // cascade 11: non-nil for /api/serial channels
+	serialOut *os.File      // cascade 11: non-nil for /api/serial channels
+	ipmiConn  *net.UDPConn  // non-nil for /ipmi/relay channels (UDP/623 to a BMC)
 }
 
 func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any, cfg config) {
@@ -929,6 +930,13 @@ func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any,
 	// instead of dialing kvmd. See agent/serial.go.
 	if path == "/api/serial" || strings.HasPrefix(path, "/api/serial?") {
 		go handleSerialOpen(ctx, writes, channelID, cfg)
+		return
+	}
+
+	// IPMI relay: the platform's pyghmi client runs server-side; we just shuttle
+	// raw RMCP+ UDP datagrams to a BMC on the local network. See ipmi.go.
+	if path == "/ipmi/relay" || strings.HasPrefix(path, "/ipmi/relay?") {
+		go handleIPMIRelayOpen(ctx, writes, channelID, path)
 		return
 	}
 
@@ -1136,6 +1144,12 @@ func handleWSFrame(msg map[string]any) {
 		return
 	}
 
+	// IPMI relay channels write each frame as one UDP datagram to the BMC.
+	if ch.ipmiConn != nil {
+		writeIPMIDatagram(ch.ipmiConn, data)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if isBinary {
@@ -1157,6 +1171,9 @@ func handleWSClose(msg map[string]any) {
 	if ch.serialOut != nil {
 		log.Printf("ws.close: serial channel %s closing TTY", channelID[:8])
 		_ = ch.serialOut.Close()
+	} else if ch.ipmiConn != nil {
+		log.Printf("ws.close: ipmi relay channel %s closing UDP", channelID[:8])
+		_ = ch.ipmiConn.Close()
 	} else if ch.conn != nil {
 		ch.conn.Close(websocket.StatusNormalClosure, "")
 	}
