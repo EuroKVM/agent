@@ -5,18 +5,39 @@ import (
 	"testing"
 )
 
-func TestIPMIHostFromPath(t *testing.T) {
-	cases := map[string]string{
-		"/ipmi/relay?host=10.0.0.5":            "10.0.0.5",
-		"/ipmi/relay?host=192.168.1.10&x=1":    "192.168.1.10",
-		"/ipmi/relay?host=bmc.local":           "bmc.local",
-		"/ipmi/relay":                          "",
-		"/ipmi/relay?host=":                     "",
-		"/ipmi/relay?foo=bar":                  "",
+func TestIPMITargetFromPath(t *testing.T) {
+	type want struct {
+		host string
+		port int
 	}
-	for path, want := range cases {
-		if got := ipmiHostFromPath(path); got != want {
-			t.Errorf("ipmiHostFromPath(%q) = %q, want %q", path, got, want)
+	cases := map[string]want{
+		"/ipmi/relay?host=10.0.0.5":         {"10.0.0.5", 623},
+		"/ipmi/relay?host=192.168.1.10&x=1": {"192.168.1.10", 623},
+		"/ipmi/relay?host=bmc.local":        {"bmc.local", 623},
+		"/ipmi/relay?host=10.0.5.20&port=161": {"10.0.5.20", 161},
+		"/ipmi/relay?host=10.0.5.20&port=xx":  {"10.0.5.20", 623},
+		"/ipmi/relay":                        {"", 623},
+		"/ipmi/relay?host=":                  {"", 623},
+		"/ipmi/relay?foo=bar":                {"", 623},
+	}
+	for path, w := range cases {
+		host, port := ipmiTargetFromPath(path)
+		if host != w.host || port != w.port {
+			t.Errorf("ipmiTargetFromPath(%q) = (%q,%d), want (%q,%d)", path, host, port, w.host, w.port)
+		}
+	}
+}
+
+// relayPortAllowed gates the UDP target port — only IPMI/623 and SNMP/161.
+func TestRelayPortAllowed(t *testing.T) {
+	for _, p := range []int{623, 161} {
+		if !relayPortAllowed(p) {
+			t.Errorf("port %d should be allowed", p)
+		}
+	}
+	for _, p := range []int{0, 22, 80, 443, 53, 8080, 65535} {
+		if relayPortAllowed(p) {
+			t.Errorf("port %d should be REFUSED", p)
 		}
 	}
 }

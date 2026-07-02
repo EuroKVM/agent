@@ -23,14 +23,23 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// ipmiUDPPort is the fixed RMCP/RMCP+ port. We do not let the platform pick an
-// arbitrary port — IPMI is 623, and constraining it keeps the relay from being
-// turned into a general-purpose UDP proxy.
-const ipmiUDPPort = "623"
+// defaultIPMIUDPPort is the RMCP/RMCP+ port. The relay also carries other
+// LAN-management UDP protocols that share this exact machinery — notably SNMP
+// (UDP 161) for PDU control — selected via the ?port= query param. We restrict
+// the target to a small allowlist of known management ports so the relay can't
+// be turned into a general-purpose UDP proxy.
+const defaultIPMIUDPPort = 623
+
+// relayPortAllowed gates which UDP ports the relay will dial. 623 = IPMI/RMCP+,
+// 161 = SNMP (PDUs). Anything else is refused.
+func relayPortAllowed(p int) bool {
+	return p == 623 || p == 161
+}
 
 // maxIPMIDatagram caps a single relayed datagram. IPMI/RMCP+ packets are well
 // under an Ethernet MTU; 9 KB covers jumbo-frame paranoia without allowing a
@@ -44,9 +53,14 @@ const maxIPMIDatagram = 9000
 // management LAN). We refuse to relay to a public IP so the agent can't be
 // abused as an open UDP reflector toward the internet.
 func handleIPMIRelayOpen(ctx context.Context, writes chan<- []byte, channelID, path string) {
-	host := ipmiHostFromPath(path)
+	host, port := ipmiTargetFromPath(path)
 	if host == "" {
 		log.Printf("ipmi.relay: ws.open missing ?host=")
+		sendWSClose(writes, channelID)
+		return
+	}
+	if !relayPortAllowed(port) {
+		log.Printf("ipmi.relay: REFUSING relay to disallowed port %d (only 623/161)", port)
 		sendWSClose(writes, channelID)
 		return
 	}
@@ -65,7 +79,7 @@ func handleIPMIRelayOpen(ctx context.Context, writes chan<- []byte, channelID, p
 		return
 	}
 
-	raddr := &net.UDPAddr{IP: target, Port: 623}
+	raddr := &net.UDPAddr{IP: target, Port: port}
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
 		log.Printf("ipmi.relay: dial %s: %v", raddr, err)
@@ -87,7 +101,7 @@ func handleIPMIRelayOpen(ctx context.Context, writes chan<- []byte, channelID, p
 		_ = conn.Close()
 		return
 	}
-	log.Printf("ipmi.relay: channel %s open → %s:%s", channelID[:8], target, ipmiUDPPort)
+	log.Printf("ipmi.relay: channel %s open → %s:%d", channelID[:8], target, port)
 
 	// BMC → platform reader. Each UDP datagram becomes exactly one ws.frame.
 	go func() {
@@ -136,17 +150,26 @@ func handleIPMIRelayOpen(ctx context.Context, writes chan<- []byte, channelID, p
 	}()
 }
 
-// ipmiHostFromPath extracts the ?host= value from /ipmi/relay?host=...
-func ipmiHostFromPath(path string) string {
+// ipmiTargetFromPath extracts (host, port) from /ipmi/relay?host=...&port=...
+// port defaults to 623 (IPMI) when absent or unparseable; PDU relays pass
+// port=161 (SNMP). The caller enforces the port allowlist.
+func ipmiTargetFromPath(path string) (string, int) {
 	q := ""
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		q = path[i+1:]
 	}
 	vals, err := url.ParseQuery(q)
 	if err != nil {
-		return ""
+		return "", 0
 	}
-	return strings.TrimSpace(vals.Get("host"))
+	host := strings.TrimSpace(vals.Get("host"))
+	port := defaultIPMIUDPPort
+	if p := strings.TrimSpace(vals.Get("port")); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			port = n
+		}
+	}
+	return host, port
 }
 
 // writeIPMIDatagram forwards one platform→BMC datagram. Called from
