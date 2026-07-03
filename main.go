@@ -58,6 +58,11 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 			st.Name, cfg.HWKind, st.DeviceID, consoleMode(cfg))
 	})
 
+	// /internal/wol — Wake-on-LAN. The platform posts {mac, broadcast, port};
+	// the agent broadcasts a magic packet on its LAN segment. Available in any
+	// console mode (it's a LAN broadcast, independent of kvmd). See wol.go.
+	mux.HandleFunc("/internal/wol", wolHandler)
+
 	if cfg.KvmdURL != "" && cfg.ConsoleMode != "proxy" {
 		// Real mode: reverse-proxy every request to the local kvmd web UI.
 		target, err := url.Parse(cfg.KvmdURL)
